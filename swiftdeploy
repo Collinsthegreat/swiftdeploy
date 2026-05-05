@@ -1,0 +1,448 @@
+#!/usr/bin/env python3
+"""
+swiftdeploy - CLI tool for SwiftDeploy stack management.
+
+Usage:
+  ./swiftdeploy <subcommand> [options]
+
+Subcommands:
+  init       Generate nginx.conf + docker-compose.yml from manifest.yaml
+  validate   Run 5 pre-flight checks
+  deploy     init + bring up stack + wait for health checks
+  promote    Switch between stable/canary mode with rolling restart
+  teardown   Remove all containers, networks, volumes [--clean]
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import re
+import socket
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.request
+from pathlib import Path
+from typing import Any
+
+import yaml
+from jinja2 import Environment, FileSystemLoader, StrictUndefined
+
+
+PROJECT_ROOT = Path(__file__).parent.resolve()
+MANIFEST_PATH = PROJECT_ROOT / "manifest.yaml"
+TEMPLATES_DIR = PROJECT_ROOT / "templates"
+NGINX_CONF_PATH = PROJECT_ROOT / "nginx.conf"
+COMPOSE_PATH = PROJECT_ROOT / "docker-compose.yml"
+
+GREEN = "\033[92m"
+RED = "\033[91m"
+YELLOW = "\033[93m"
+BLUE = "\033[94m"
+BOLD = "\033[1m"
+RESET = "\033[0m"
+
+
+def ok(message: str) -> None:
+    print(f"{GREEN}PASS {message}{RESET}")
+
+
+def fail(message: str) -> None:
+    print(f"{RED}FAIL {message}{RESET}")
+
+
+def info(message: str) -> None:
+    print(f"{BLUE}INFO {message}{RESET}")
+
+
+def warn(message: str) -> None:
+    print(f"{YELLOW}WARN {message}{RESET}")
+
+
+def header(message: str) -> None:
+    print(f"\n{BOLD}{message}{RESET}\n{'-' * 50}")
+
+
+def load_manifest() -> dict[str, Any]:
+    if not MANIFEST_PATH.exists():
+        fail(f"manifest.yaml not found at {MANIFEST_PATH}")
+        sys.exit(1)
+
+    try:
+        with MANIFEST_PATH.open("r", encoding="utf-8") as manifest_file:
+            manifest = yaml.safe_load(manifest_file)
+    except yaml.YAMLError as exc:
+        fail(f"manifest.yaml invalid: {exc}")
+        sys.exit(1)
+
+    if not isinstance(manifest, dict):
+        fail("manifest.yaml must contain a YAML mapping at the top level")
+        sys.exit(1)
+
+    return manifest
+
+
+def render_template(template_name: str, context: dict[str, Any]) -> str:
+    env = Environment(
+        loader=FileSystemLoader(str(TEMPLATES_DIR)),
+        undefined=StrictUndefined,
+        trim_blocks=True,
+        lstrip_blocks=True,
+        autoescape=False,
+    )
+    template = env.get_template(template_name)
+    return template.render(**context)
+
+
+def write_file(path: Path, content: str) -> None:
+    path.write_text(content.rstrip() + "\n", encoding="utf-8")
+
+
+def cmd_init() -> None:
+    header("SwiftDeploy Init")
+    manifest = load_manifest()
+
+    info("Generating nginx.conf from template...")
+    write_file(NGINX_CONF_PATH, render_template("nginx.conf.j2", manifest))
+    ok(f"Generated: {NGINX_CONF_PATH}")
+
+    info("Generating docker-compose.yml from template...")
+    write_file(COMPOSE_PATH, render_template("docker-compose.yml.j2", manifest))
+    ok(f"Generated: {COMPOSE_PATH}")
+
+    ok("Init complete. Run ./swiftdeploy validate to verify.")
+
+
+def required_field_failures(manifest: dict[str, Any]) -> list[str]:
+    services = manifest.get("services", {})
+    nginx = manifest.get("nginx", {})
+    network = manifest.get("network", {})
+
+    required = {
+        "services.name": services.get("name"),
+        "services.image": services.get("image"),
+        "services.port": services.get("port"),
+        "services.mode": services.get("mode"),
+        "services.version": services.get("version"),
+        "services.restart_policy": services.get("restart_policy"),
+        "services.log_volume": services.get("log_volume"),
+        "services.healthcheck_path": services.get("healthcheck_path"),
+        "services.healthcheck_interval": services.get("healthcheck_interval"),
+        "services.healthcheck_timeout": services.get("healthcheck_timeout"),
+        "services.healthcheck_retries": services.get("healthcheck_retries"),
+        "nginx.image": nginx.get("image"),
+        "nginx.port": nginx.get("port"),
+        "nginx.proxy_timeout": nginx.get("proxy_timeout"),
+        "nginx.access_log": nginx.get("access_log"),
+        "network.name": network.get("name"),
+        "network.driver_type": network.get("driver_type"),
+    }
+
+    missing = []
+    for field_name, value in required.items():
+        if value is None:
+            missing.append(field_name)
+        elif isinstance(value, str) and not value.strip():
+            missing.append(field_name)
+        elif isinstance(value, int) and value == 0:
+            missing.append(field_name)
+
+    return missing
+
+
+def run_capture(command: list[str]) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        command,
+        cwd=str(PROJECT_ROOT),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+
+def run_streaming(command: list[str]) -> int:
+    return subprocess.run(command, cwd=str(PROJECT_ROOT), check=False).returncode
+
+
+def is_port_bound(port: int) -> bool:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.settimeout(1)
+        return sock.connect_ex(("127.0.0.1", int(port))) == 0
+
+
+def cmd_validate() -> None:
+    header("SwiftDeploy Validate - Pre-flight Checks")
+    manifest = load_manifest()
+    all_passed = True
+
+    info("Check 1: manifest.yaml exists and is valid YAML")
+    try:
+        with MANIFEST_PATH.open("r", encoding="utf-8") as manifest_file:
+            yaml.safe_load(manifest_file)
+        ok("manifest.yaml exists and is valid YAML")
+    except Exception as exc:  # noqa: BLE001 - CLI must show a clear failure.
+        fail(f"manifest.yaml invalid: {exc}")
+        all_passed = False
+
+    info("Check 2: Required fields present and non-empty")
+    missing = required_field_failures(manifest)
+    if missing:
+        fail(f"Missing required fields: {', '.join(missing)}")
+        all_passed = False
+    else:
+        ok("All required fields present and non-empty")
+
+    info("Check 3: Docker image exists locally")
+    image = str(manifest.get("services", {}).get("image", ""))
+    result = run_capture(["docker", "image", "inspect", image])
+    if result.returncode == 0:
+        ok(f"Docker image '{image}' exists locally")
+    else:
+        fail(f"Docker image '{image}' not found locally. Run: docker build -t {image} app/")
+        all_passed = False
+
+    info("Check 4: Nginx port is not already bound on host")
+    nginx_port = int(manifest.get("nginx", {}).get("port", 8080))
+    if is_port_bound(nginx_port):
+        fail(f"Port {nginx_port} is already in use on the host")
+        all_passed = False
+    else:
+        ok(f"Port {nginx_port} is available")
+
+    info("Check 5: nginx.conf syntax is valid")
+    if not NGINX_CONF_PATH.exists():
+        fail("nginx.conf not found - run ./swiftdeploy init first")
+        all_passed = False
+    else:
+        service_name = str(manifest.get("services", {}).get("name", "swiftdeploy-app"))
+        result = run_capture(
+            [
+                "docker",
+                "run",
+                "--rm",
+                "--add-host",
+                f"{service_name}:127.0.0.1",
+                "-v",
+                f"{NGINX_CONF_PATH}:/etc/nginx/nginx.conf:ro",
+                str(manifest.get("nginx", {}).get("image", "nginx:latest")),
+                "nginx",
+                "-t",
+            ]
+        )
+        if result.returncode == 0:
+            ok("nginx.conf syntax is valid")
+        else:
+            fail(f"nginx.conf syntax error:\n{result.stderr}")
+            all_passed = False
+
+    print()
+    if all_passed:
+        ok("All 5 checks passed. Ready to deploy.")
+        sys.exit(0)
+
+    fail("One or more checks failed. Fix issues before deploying.")
+    sys.exit(1)
+
+
+def http_get(url: str, timeout: int = 3) -> tuple[int, bytes]:
+    with urllib.request.urlopen(url, timeout=timeout) as response:
+        return response.status, response.read()
+
+
+def cmd_deploy() -> None:
+    header("SwiftDeploy Deploy")
+    cmd_init()
+
+    info("Bringing up the stack...")
+    result = run_streaming(["docker", "compose", "-f", str(COMPOSE_PATH), "up", "-d", "--remove-orphans"])
+    if result != 0:
+        fail("docker compose up failed")
+        sys.exit(1)
+
+    manifest = load_manifest()
+    nginx_port = int(manifest.get("nginx", {}).get("port", 8080))
+    health_path = str(manifest.get("services", {}).get("healthcheck_path", "/healthz"))
+    health_url = f"http://localhost:{nginx_port}{health_path}"
+
+    info("Waiting for health checks to pass (timeout: 60s)...")
+    info(f"Health URL: {health_url}")
+    deadline = time.time() + 60
+    healthy = False
+
+    while time.time() < deadline:
+        try:
+            status, _ = http_get(health_url)
+            if status == 200:
+                healthy = True
+                break
+        except Exception:
+            pass
+        time.sleep(3)
+        print(".", end="", flush=True)
+
+    print()
+    if healthy:
+        ok(f"Stack is healthy and responding at http://localhost:{nginx_port}")
+        ok("Deploy complete.")
+        return
+
+    fail("Health checks did not pass within 60 seconds.")
+    info(f"Check logs with: docker compose -f {COMPOSE_PATH} logs")
+    sys.exit(1)
+
+
+def cmd_promote(args: list[str]) -> None:
+    if not args:
+        fail("Usage: ./swiftdeploy promote [canary|stable]")
+        sys.exit(1)
+
+    target_mode = args[0].lower()
+    if target_mode not in {"canary", "stable"}:
+        fail(f"Invalid mode '{target_mode}'. Must be: canary or stable")
+        sys.exit(1)
+
+    header(f"SwiftDeploy Promote -> {target_mode}")
+    manifest = load_manifest()
+    current_mode = str(manifest.get("services", {}).get("mode", "stable"))
+
+    if current_mode == target_mode:
+        warn(f"Already in {target_mode} mode. No action taken.")
+        sys.exit(0)
+
+    info(f"Switching from {current_mode} -> {target_mode}")
+    manifest_text = MANIFEST_PATH.read_text(encoding="utf-8")
+    updated_manifest = re.sub(
+        r"(^\s*mode:\s*)\S+",
+        rf"\g<1>{target_mode}",
+        manifest_text,
+        count=1,
+        flags=re.MULTILINE,
+    )
+    if updated_manifest == manifest_text:
+        fail("could not find services.mode in manifest.yaml")
+        sys.exit(1)
+
+    MANIFEST_PATH.write_text(updated_manifest, encoding="utf-8")
+    ok(f"manifest.yaml updated: mode = {target_mode}")
+
+    manifest = load_manifest()
+    write_file(COMPOSE_PATH, render_template("docker-compose.yml.j2", manifest))
+    ok("docker-compose.yml regenerated")
+
+    service_name = str(manifest.get("services", {}).get("name", "swiftdeploy-app"))
+    info(f"Restarting service container: {service_name}...")
+    result = run_streaming(
+        [
+            "docker",
+            "compose",
+            "-f",
+            str(COMPOSE_PATH),
+            "up",
+            "-d",
+            "--no-deps",
+            "--force-recreate",
+            service_name,
+        ]
+    )
+    if result != 0:
+        fail("Service restart failed")
+        sys.exit(1)
+
+    info("Waiting for service to become healthy...")
+    nginx_port = int(manifest.get("nginx", {}).get("port", 8080))
+    health_path = str(manifest.get("services", {}).get("healthcheck_path", "/healthz"))
+    health_url = f"http://localhost:{nginx_port}{health_path}"
+    deadline = time.time() + 60
+    confirmed = False
+
+    while time.time() < deadline:
+        try:
+            status, body = http_get(health_url)
+            if status == 200 and json.loads(body.decode("utf-8")).get("mode") == target_mode:
+                confirmed = True
+                break
+        except Exception:
+            pass
+        time.sleep(3)
+        print(".", end="", flush=True)
+
+    print()
+    if confirmed:
+        ok(f"Mode confirmed via /healthz: mode={target_mode}")
+        ok(f"Promote to {target_mode} complete.")
+        return
+
+    fail(f"Could not confirm {target_mode} mode via /healthz within 60s")
+    sys.exit(1)
+
+
+def cmd_teardown(args: list[str]) -> None:
+    header("SwiftDeploy Teardown")
+    clean = "--clean" in args
+
+    info("Stopping and removing containers, networks, volumes...")
+    if COMPOSE_PATH.exists():
+        result = run_streaming(["docker", "compose", "-f", str(COMPOSE_PATH), "down", "-v", "--remove-orphans"])
+        if result != 0:
+            fail("docker compose down failed")
+            sys.exit(1)
+    else:
+        warn("docker-compose.yml not found; skipping docker compose down")
+    ok("Containers, networks, and volumes removed")
+
+    if clean:
+        info("--clean flag set: removing generated config files...")
+        for path in (NGINX_CONF_PATH, COMPOSE_PATH):
+            if path.exists():
+                path.unlink()
+                ok(f"Deleted: {path}")
+        ok("Clean teardown complete.")
+        return
+
+    ok("Teardown complete. Generated configs preserved.")
+    info("Use --clean to also remove generated nginx.conf and docker-compose.yml")
+
+
+def usage() -> None:
+    print(
+        f"""
+{BOLD}SwiftDeploy CLI{RESET}
+Usage: ./swiftdeploy <subcommand> [options]
+
+Subcommands:
+  init                Generate nginx.conf + docker-compose.yml from manifest.yaml
+  validate            Run 5 pre-flight checks
+  deploy              init + bring up stack + wait for health checks (60s timeout)
+  promote [mode]      Switch to canary or stable mode with rolling restart
+  teardown [--clean]  Remove all containers/networks/volumes; --clean deletes generated configs
+"""
+    )
+
+
+def main() -> None:
+    if len(sys.argv) < 2:
+        usage()
+        sys.exit(1)
+
+    subcommand = sys.argv[1]
+    args = sys.argv[2:]
+
+    if subcommand == "init":
+        cmd_init()
+    elif subcommand == "validate":
+        cmd_validate()
+    elif subcommand == "deploy":
+        cmd_deploy()
+    elif subcommand == "promote":
+        cmd_promote(args)
+    elif subcommand == "teardown":
+        cmd_teardown(args)
+    else:
+        fail(f"Unknown subcommand: {subcommand}")
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()

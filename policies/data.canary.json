@@ -1,0 +1,6 @@
+{
+  "thresholds": {
+    "max_error_rate_percent": 1.0,
+    "max_p99_latency_ms": 500.0
+  }
+}

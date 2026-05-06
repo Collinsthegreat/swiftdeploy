@@ -1,0 +1,6 @@
+{
+  "thresholds": {
+    "min_disk_free_gb": 10.0,
+    "max_cpu_load": 2.0
+  }
+}

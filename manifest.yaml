@@ -22,3 +22,8 @@ nginx:
 network:
   name: swiftdeploy-net
   driver_type: bridge
+
+opa:
+  image: openpolicyagent/opa:latest-rootless
+  port: 8181
+  policies_dir: ./policies

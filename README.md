@@ -120,8 +120,7 @@ curl http://localhost:8181/health
 
 ## Blog Post
 
-Publish the Stage 4B blog post before submission and replace this line with the
-published URL.
+https://medium.com/@abuchicollins449/swiftdeploy-building-a-policy-gated-observable-deployment-tool-with-go-docker-nginx-and-opa-c3900bb99749
 
 ## GitHub Repository
 
